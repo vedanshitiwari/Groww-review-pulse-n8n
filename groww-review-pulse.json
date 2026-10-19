@@ -1,0 +1,897 @@
+{
+  "name": "Groww Review Pulse",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Run weekly review pulse",
+        "formDescription": "Analyses Groww Play Store reviews and creates a weekly pulse and fee explainer",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Analysis window",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Last 12 weeks"
+                  },
+                  {
+                    "option": "Last 4 weeks"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "739592a2-b0e5-47b0-8084-e06e590222c4",
+      "name": "Run weekly review pulse",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -288,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "Groww Reviews",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1949490117,
+          "mode": "list",
+          "cachedResultName": "reviews_sheet",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID/edit#gid=1949490117"
+        },
+        "filtersUI": {
+          "values": []
+        },
+        "options": {}
+      },
+      "id": "0cf4e982-94c1-42b0-82cc-0c356a939918",
+      "name": "Get reviews",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -128,
+        -16
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prep reviews: clean, filter by window, build samples for the AI\nconst rows = $input.all().map(i => i.json);\nconst choice = $('Run weekly review pulse').first().json['Analysis window'] || '';\nconst weeks = choice.includes('4') ? 4 : 12;\n\nconst isTrue = v => v === true || String(v).toLowerCase() === 'true';\nconst dates = rows.map(r => String(r.date)).filter(Boolean).sort();\nconst latest = dates[dates.length - 1];\nconst cutoff = new Date(latest);\ncutoff.setDate(cutoff.getDate() - weeks * 7);\n\nconst clean = rows\n  .filter(r => r.review_text && String(r.review_text).length >= 20 && new Date(r.date) >= cutoff)\n  .map(r => ({\n    id: String(r.review_id),\n    date: String(r.date),\n    rating: Number(r.rating),\n    text: String(r.review_text).replace(/\\s+/g, ' ').slice(0, 500),\n    fee: isTrue(r.fee_related),\n  }));\n\n// Fixed-seed shuffle so results are repeatable\nfunction mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }\nconst rand = mulberry32(42);\nconst shuffled = [...clean];\nfor (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }\n\nconst themeSample = shuffled.slice(0, 600);              // random, unbiased: for themes\nconst feeSample = clean.filter(r => r.fee).slice(0, 400); // fee-related only: for the fee issue\nconst ratingCounts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };\nclean.forEach(r => { ratingCounts[r.rating] = (ratingCounts[r.rating] || 0) + 1; });\n\nreturn [{ json: {\n  window_weeks: weeks,\n  date_from: cutoff.toISOString().slice(0, 10),\n  date_to: latest,\n  total_reviews: clean.length,\n  rating_counts: ratingCounts,\n  fee_related_count: feeSample.length,\n  theme_sample_size: themeSample.length,\n  theme_sample_text: themeSample.map((r, i) => `#${i + 1} (${r.rating} stars) ${r.text}`).join('\\n'),\n  theme_sample: themeSample,\n  fee_sample_text: feeSample.map(r => `[${r.id}] (${r.rating} stars) ${r.text}`).join('\\n'),\n  all_reviews: clean,\n} }];"
+      },
+      "id": "b90e4ab7-413b-4d0e-a60b-165bff69996a",
+      "name": "Prep reviews",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI answers, count themes with code, verify quotes and evidence\nconst prep = $('Prep reviews').first().json;\n\nconst cleanText = t => String(t).replace(/```json|```/g, '').replace(/[\\u0000-\\u001F]+/g, ' ');\nconst parse = t => {\n  const s = cleanText(t);\n  return JSON.parse(s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1));\n};\n\n// Themes: parse normally; if the AI answer was cut off, recover what we can\nfunction parseThemes(t) {\n  try { return { ...parse(t), recovered: false }; }\n  catch (e) {\n    const s = cleanText(t);\n    const ti = s.indexOf('\"themes\"'), li = s.indexOf('\"labels\"');\n    const themes = JSON.parse(s.slice(s.indexOf('[', ti), s.lastIndexOf(']', li) + 1));\n    const labels = {};\n    for (const m of s.slice(li).matchAll(/\"(\\d+)\"\\s*:\\s*(\\d+)/g)) labels[m[1]] = Number(m[2]);\n    return { themes, labels, recovered: true };\n  }\n}\n\nconst th = parseThemes($('Themes LLM : Find Review Themes').first().json.text);\nconst fee = parse($('Fee LLM : Spot Fee Complaints').first().json.text);\n\n// Count theme labels with code (exact numbers, not AI estimates)\nconst sample = prep.theme_sample;\nconst themes = (th.themes || []).slice(0, 5);\nconst counts = themes.map(() => 0);\nlet other = 0;\nconst labels = th.labels || {};\nfor (const v of Object.values(labels)) {\n  const k = Number(v);\n  if (k >= 1 && k <= themes.length) counts[k - 1]++; else other++;\n}\nconst labelled = Object.keys(labels).length || 1;\nconst ranked = themes\n  .map((t, i) => ({\n    name: t.name, description: t.description,\n    sentiment: t.sentiment || '', product_area: t.product_area || '',\n    count: counts[i], share_pct: Math.round(100 * counts[i] / labelled),\n    quote_nums: t.quote_nums || [], index: i + 1,\n  }))\n  .sort((a, b) => b.count - a.count);\nconst top3 = ranked.slice(0, 3);\n\n// Quotes: taken from the real review text, personal data masked\nconst mask = s => s.replace(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/g, '[redacted]').replace(/\\+?\\d[\\d\\s-]{8,}\\d/g, '[redacted]');\nconst short = s => (s.length > 220 ? s.slice(0, 217) + '...' : s);\nconst quotes = [];\nfor (const t of top3) {\n  let pick = t.quote_nums.map(n => sample[Number(n) - 1]).find(r => r);\n  if (!pick) {\n    const n = Object.keys(labels).find(k => Number(labels[k]) === t.index);\n    pick = n ? sample[Number(n) - 1] : null;\n  }\n  if (pick) quotes.push({ theme: t.name, rating: pick.rating, review_id: pick.id, text: mask(short(pick.text)) });\n}\n\n// Fee evidence: keep only review_ids that really exist\nconst ids = new Set(prep.all_reviews.map(r => r.id));\nconst evidence = (fee.evidence_ids || []).map(String).filter(id => ids.has(id));\n\nreturn [{ json: {\n  date_from: prep.date_from, date_to: prep.date_to, total_reviews: prep.total_reviews,\n  rating_counts: prep.rating_counts, theme_sample_size: prep.theme_sample_size,\n  labelled_count: Object.keys(labels).length, labels_recovered: th.recovered, other_count: other,\n  themes: ranked, top3, quotes,\n  fee_issue: {\n    fee_name: fee.fee_name, confusion: fee.confusion,\n    user_expectation: fee.user_expectation || '', what_users_notice: fee.what_users_notice || '',\n    user_phrasing: fee.user_phrasing || [], topics_to_verify: fee.topics_to_verify || [],\n    evidence_ids: evidence, evidence_count: evidence.length,\n    fee_related_reviews: prep.fee_related_count,\n  },\n} }];"
+      },
+      "id": "ecb90169-4d05-42eb-bdf2-829b90585031",
+      "name": "Count & verify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [\n  { json: { url: 'https://groww.in/pricing' } },\n  { json: { url: 'https://groww.in/help/stocks/sx-pricing/what-are-intraday-charges' } },\n];"
+      },
+      "id": "5a66e420-bf31-46e4-8e08-3b4ee7b8356a",
+      "name": "Source URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "e53e4dc2-c2df-4659-93fd-e61a07d00d37",
+      "name": "Fetch official pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1280,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the downloaded web pages into clean text for the explainer\nconst urls = $('Source URLs').all().map(i => i.json.url);\nconst pages = $input.all().map((item, i) => {\n  const html = String(item.json.data || item.json.body || '');\n  const text = html\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8377;|&#x20b9;/gi, '₹')\n    .replace(/\\s+/g, ' ').trim();\n    return { url: urls[i], chars: text.length, text: text.slice(0, 30000) };\n});\nconst today = new Date().toISOString().slice(0, 10);\nreturn [{ json: {\n  sources: pages.map(p => ({ url: p.url, chars: p.chars })),\n  last_checked: today,\n  sources_text: pages.map((p, i) => `SOURCE ${i + 1}: ${p.url}\\n${p.text}`).join('\\n\\n'),\n} }];"
+      },
+      "id": "1f56e716-f7b0-410b-9a3c-8d9ebe2fcba7",
+      "name": "Clean sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final pulse + explainer, and enforce the assignment limits\nconst cv = $('Count & verify').first().json;\nconst src = $('Clean sources').first().json;\n\n// Tolerant JSON reader: tries several common AI format slips before giving up\nconst parse = (t, name) => {\n  const raw = String(t || '');\n  const base = raw.replace(/```json|```/g, '');\n  const cut = s => s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1);\n  const attempts = [\n    s => cut(s).replace(/[\\u0000-\\u001F]+/g, ' '),                                   // real line breaks\n    s => cut(s).replace(/\\\\n|\\\\t|\\\\r/g, ' ').replace(/\\\\\"/g, '\"'),                   // escaped line breaks\n    s => cut(s).replace(/[\\u0000-\\u001F]+/g, ' ').replace(/[“”]/g, '\"').replace(/,\\s*([}\\]])/g, '$1'), // smart quotes, trailing commas\n  ];\n  for (const fix of attempts) {\n    try { return JSON.parse(fix(base)); } catch (e) { /* try next */ }\n  }\n  try { const once = JSON.parse(raw); if (typeof once === 'string') return JSON.parse(once); } catch (e) { /* ignore */ }\n  throw new Error(`${name} did not return valid JSON. It starts with: ${raw.slice(0, 300)}`);\n};\n\nconst p = parse($('Pulse LLM : Write Weekly Pulse').first().json.text, 'Pulse LLM');\nconst e = parse($('Explainer LLM : Explain Fee with Facts').first().json.text, 'Explainer LLM');\nconst words = s => s.split(/\\s+/).filter(Boolean).length;\nconst fi = cv.fee_issue;\n\n// Pulse: built by code from verified data; quotes shortened if needed to stay within 250 words\nfunction buildPulse(maxQuoteWords) {\n  const cutQ = s => { const w = s.split(/\\s+/); return w.length > maxQuoteWords ? w.slice(0, maxQuoteWords).join(' ') + '...' : s; };\n  return [\n    'WEEKLY PRODUCT PULSE: Groww app (Play Store, India)',\n    `Window: ${cv.date_from} to ${cv.date_to} | ${cv.total_reviews} reviews`,\n    '',\n    `Top themes (share of ${cv.theme_sample_size} sampled reviews):`,\n    ...cv.top3.map((t, i) => `${i + 1}. ${t.name}: ${t.share_pct}%`),\n    '',\n    'What users said:',\n    ...cv.quotes.map(q => `- \"${cutQ(q.text)}\" (${q.rating} stars)`),\n    '',\n    `Key observation: ${p.key_observation}`,\n    '',\n    'Action ideas:',\n    ...(p.actions || []).slice(0, 3).map((a, i) => `${i + 1}. ${a}`),\n  ].join('\\n');\n}\nlet pulse = buildPulse(40);\nfor (const n of [25, 15, 10]) { if (words(pulse) <= 250) break; pulse = buildPulse(n); }\n\n// Explainer: max 6 bullets, links and date added by code (never invented by the AI)\nconst bullets = (e.bullets || []).slice(0, 6);\nconst links = src.sources.map(s => s.url).slice(0, 2);\nconst explainer = [\n  e.title || fi.fee_name,\n  ...bullets.map(b => `- ${b}`),\n  `Sources: ${links.join(' | ')}`,\n  `Last checked: ${src.last_checked}`,\n].join('\\n');\n\nconst checks = {\n  pulse_words: words(pulse), pulse_ok: words(pulse) <= 250,\n  bullets: bullets.length, bullets_ok: bullets.length > 0 && bullets.length <= 6,\n  links: links.length, links_ok: links.length === 2,\n  quotes: cv.quotes.length, themes: cv.themes.length,\n};\nchecks.all_ok = checks.pulse_ok && checks.bullets_ok && checks.links_ok && checks.quotes === 3 && checks.themes <= 5;\n\nconst today = new Date().toISOString().slice(0, 10);\nreturn [{ json: {\n  date: today,\n  top_themes: cv.top3.map(t => t.name),\n  weekly_pulse: pulse,\n  identified_fee_issue: `${fi.fee_name}: ${fi.confusion}`,\n  explanation_bullets: bullets,\n  source_links: links,\n  explainer,\n  email_subject: `Weekly Product Pulse + Customer Clarification — ${today}`,\n  email_body: `Hi team,\\n\\n${pulse}\\n\\n---\\nCUSTOMER SUPPORT SNIPPET (reusable)\\n\\n${explainer}\\n`,\n  checks,\n} }];"
+      },
+      "id": "b16995c2-e207-4830-9d84-a07bce90a4b1",
+      "name": "Assemble & check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "formFields": {
+          "values": [
+            {
+              "fieldType": "html",
+              "html": "<h3>Weekly pulse ({{ $json.checks.pulse_words }} words, limit 250)</h3>\n<pre style=\"white-space:pre-wrap;font-family:inherit\">{{ $json.weekly_pulse }}</pre>\n<h3>Fee explainer</h3>\n<pre style=\"white-space:pre-wrap;font-family:inherit\">{{ $json.explainer }}</pre>\n<p><b>Checks:</b> {{ $json.checks.all_ok ? 'All passed' : 'Some checks failed, review before approving' }}</p>"
+            },
+            {
+              "fieldLabel": "Decision",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Approve"
+                  },
+                  {
+                    "option": "Reject"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f6842fa2-574a-4018-8adc-74dd9938356a",
+      "name": "Review page",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        2448,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b64f88c0-5533-4346-8ea2-f0664e7b467a",
+              "leftValue": "={{ $json.Decision }}",
+              "rightValue": "Approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d1b9350b-b8ec-4611-90c1-b89be4f4d8a7",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2672,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "Approved",
+        "completionMessage": "Entry added to Weekly Pulse Log and a Gmail draft was created (not sent).",
+        "options": {}
+      },
+      "id": "3a7a27e4-7b8a-4f99-8e80-cd803654f223",
+      "name": "Approved",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        3488,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 240,
+        "width": 656,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -400,
+        -48
+      ],
+      "typeVersion": 1,
+      "id": "b711f7f9-0821-403e-ac2c-ae1abfbb5758",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 384,
+        "width": 736,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        288,
+        -32
+      ],
+      "typeVersion": 1,
+      "id": "9c031b96-78b1-4323-a7d2-cb0c5981fe4a",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 272,
+        "width": 544,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1056,
+        -80
+      ],
+      "typeVersion": 1,
+      "id": "4ab918f0-40f4-4f65-9ba3-171195e934b2",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 448,
+        "width": 752,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1632,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "c3aa231a-edbd-4edc-9a59-059afb9e6407",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 320,
+        "width": 560,
+        "color": "#C1E6DF"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2416,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "c86349d2-f5cd-48c6-9677-4bd27b32046c",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "content": "",
+        "height": 448,
+        "width": 624,
+        "color": "#B3C6DB"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        3024,
+        -96
+      ],
+      "typeVersion": 1,
+      "id": "604fd7c3-63ab-4614-86cd-6f1cfff1d2c7",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "Rejected",
+        "completionMessage": "Nothing was saved to the Doc or Gmail.",
+        "options": {}
+      },
+      "id": "4a8c6734-d201-4f07-9621-a53ee4a30b2a",
+      "name": "Rejected",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "\nStep 1 · Collect reviews\n\nEvery week this flow pulls the latest Play Store reviews from Google Sheets and cleans them.",
+        "width": 656,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -400,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "f751858a-4e94-481b-9e4c-6c80edb8d758",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "Step 2 · Understand\nGemini groups reviews into themes and finds fee complaints. Code re-counts every number.",
+        "width": 736,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        288,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "860eb117-3802-4b83-ab61-c6f293969516",
+      "name": "Sticky Note7"
+    },
+    {
+      "parameters": {
+        "content": "Step 3 · Get the facts\nOpens the company's official pricing and help pages and cleans them into plain text",
+        "width": 544,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1056,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "1a617b6d-80a9-485a-a553-f2437a3ad802",
+      "name": "Sticky Note8"
+    },
+    {
+      "parameters": {
+        "content": "Step 4 · Write the report\nOne AI writes the weekly pulse, another explains fees using only official sources.",
+        "width": 752,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1632,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "f99af2a4-e271-42aa-9ea7-93f894125b4f",
+      "name": "Sticky Note9"
+    },
+    {
+      "parameters": {
+        "content": "Step 5 · Human approval\nNothing is sent automatically. A person reads the report and approves or rejects it.",
+        "width": 560,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2416,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "f6cf5e37-94e6-40c9-bdd0-9b700b593d2f",
+      "name": "Sticky Note10"
+    },
+    {
+      "parameters": {
+        "content": "Step 6 · Deliver\nAfter approval, the AI agent uses MCP tools to send the report to the team",
+        "width": 624,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        3024,
+        -128
+      ],
+      "typeVersion": 1,
+      "id": "c87f572a-0d74-414c-b28e-d094b80d00e0",
+      "name": "Sticky Note11"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.8-flash",
+        "options": {}
+      },
+      "id": "bb2db585-3e9d-4032-92c3-6c39a1dafcb6",
+      "name": "Gemini: Theme Finder",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        352,
+        144
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.8-flash",
+        "options": {}
+      },
+      "id": "8dd71f23-6d9d-4615-aed6-39d187945fab",
+      "name": "Gemini : Fee Detector",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        624,
+        144
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.8-flash",
+        "options": {}
+      },
+      "id": "f2b754a9-e566-4dae-a3be-5aba299856da",
+      "name": "Gemini : Pulse Writer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1680,
+        144
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.8-flash",
+        "options": {}
+      },
+      "id": "fabda115-d568-4409-b143-485e31017a94",
+      "name": "Gemini : Fee Explainer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1968,
+        144
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.8-flash",
+        "options": {}
+      },
+      "id": "7a90ed2c-65a0-451c-b76e-8f6e916e1044",
+      "name": "Gemini : Agent Brain",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        3136,
+        144
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "endpointUrl": "https://YOUR-N8N-INSTANCE/mcp/YOUR_MCP_PATH",
+        "options": {}
+      },
+      "id": "7eed9e16-f701-449f-bc46-3e39a22606b7",
+      "name": "MCP : Send Tools",
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.4,
+      "position": [
+        3280,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=A human has APPROVED the outputs below. Use your tools exactly as instructed and do not change any wording.\n\n1. Call the Google Docs update-document tool (insert text) ONCE with this exact text:\n==========\nDATE: {{ $('Assemble & check').first().json.date }}\nTOP THEMES: {{ $('Assemble & check').first().json.top_themes.join(', ') }}\n\nWEEKLY PULSE:\n{{ $('Assemble & check').first().json.weekly_pulse }}\n\nIDENTIFIED FEE ISSUE: {{ $('Assemble & check').first().json.identified_fee_issue }}\n\nEXPLANATION BULLETS:\n{{ $('Assemble & check').first().json.explanation_bullets.map(b => '- ' + b).join('\\n') }}\n\nSOURCE LINKS: {{ $('Assemble & check').first().json.source_links.join(' | ') }}\n==========\n\n2. Call the Gmail create-draft tool ONCE with:\nSubject: {{ $('Assemble & check').first().json.email_subject }}\nMessage:\n{{ $('Assemble & check').first().json.email_body }}\n\nNever send an email; only create a draft. After both tool calls, reply exactly: \"Done: doc appended, draft created\".",
+        "options": {
+          "systemMessage": "You are a careful assistant that saves approved content.\n\nRULES\n- Use the available tools exactly as instructed and call each tool only once.\n- Never send email. Only create drafts.\n- Never change the wording of themes, quotes, actions or fee bullets. You may only arrange them into the layout below.\n- Write plain text only. Never use markdown symbols like #, ** or _.\n\nTOOL 1: Google Docs (append the report)\nSend the report in exactly this layout. Fill the {} parts from the input.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 WEEKLY PRODUCT PULSE · {DATE}\nGroww app · Play Store (India)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWindow: {start date} to {end date}\nReviews analysed: {sampled} of {total}\n\n▌TOP THEMES\n1. {theme 1} — {share}%\n2. {theme 2} — {share}%\n3. {theme 3} — {share}%\n\n▌WHAT USERS SAID\n“{quote 1}” ({stars}★)\n“{quote 2}” ({stars}★)\n“{quote 3}” ({stars}★)\n\n▌KEY OBSERVATION\n{observation}\n\n▌ACTION IDEAS\n1. {action 1}\n2. {action 2}\n3. {action 3}\n\n──────────────────────────────\n💸 FEE EXPLAINER · {fee issue name}\n──────────────────────────────\n\nWHAT USERS GOT WRONG\n{identified fee issue in one sentence}\n\nWHAT'S ACTUALLY TRUE\n- {bullet 1}\n- {bullet 2}\n- {bullet 3}\n- {bullet 4}\n- {bullet 5}\n\nSOURCES\n{link 1}\n{link 2}\nLast checked: {DATE}\n\n\nTOOL 2: Gmail (create a draft only)\nSubject: Groww Weekly Pulse · {DATE}\nBody: Start with \"Hi team,\" then one line saying this week's pulse is ready, then the same report text as above, then end with \"Thanks\"."
+        }
+      },
+      "id": "de7e466b-cb32-4f56-beb1-9ad16b3c2012",
+      "name": "MCP Agent : Delivery Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        3136,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=ROLE\nYou are a product analyst writing a weekly pulse for the Groww product team from Play Store reviews.\n\nDATA\nWindow: {{ $('Count & verify').first().json.date_from }} to {{ $('Count & verify').first().json.date_to }} ({{ $('Count & verify').first().json.total_reviews }} reviews)\nTop themes (share of sampled reviews):\n{{ $('Count & verify').first().json.top3.map((t, i) => (i + 1) + '. ' + t.name + ' (' + t.share_pct + '%): ' + t.description).join('\\n') }}\nRepresentative quotes:\n{{ $('Count & verify').first().json.quotes.map(q => '- ' + q.text + ' (' + q.rating + ' stars)').join('\\n') }}\n\nTASK\n1. Write ONE key observation (max 40 words) that connects the themes to what users feel.\n2. Write exactly 3 concrete action ideas for the product team (each under 25 words).\n\nRULES\n- Use only the data above. No invented numbers.\n\nOUTPUT: valid JSON only, no markdown, no code explanation:\n{\"key_observation\":\"\",\"actions\":[\"\",\"\",\"\"]}",
+        "batching": {}
+      },
+      "id": "d9dfd40c-f4cf-45cd-98e7-3b79516ae6d2",
+      "name": "Pulse LLM : Write Weekly Pulse",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1680,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=ROLE\nYou write neutral, facts-only help-centre content for Groww customer support.\n\nWHAT USERS ARE CONFUSED ABOUT (found in Play Store reviews)\nCharge: {{ $('Count & verify').first().json.fee_issue.fee_name }}\nConfusion: {{ $('Count & verify').first().json.fee_issue.confusion }}\nUsers expect: {{ $('Count & verify').first().json.fee_issue.user_expectation }}\nUsers notice: {{ $('Count & verify').first().json.fee_issue.what_users_notice }}\nFacts to confirm: {{ ($('Count & verify').first().json.fee_issue.topics_to_verify || []).join('; ') }}\n\nOFFICIAL SOURCES (the ONLY facts you may use)\n{{ $('Clean sources').first().json.sources_text }}\n\nTASK\nWrite a customer-facing explanation of this charge in AT MOST 6 bullet points.\n\nRULES\n- Every fact, rate or amount must appear in the official sources above. If it is not there, leave it out.\n- The first bullet directly clears up the confusion in one plain sentence.\n- If the sources mention where users can see or estimate their exact charges, include that.\n- Neutral, plain language. No marketing, no blame, no investment advice.\n- Each bullet under 30 words.\n\nOUTPUT: valid JSON only, no markdown:\n{\"title\":\"short title for the explainer\",\"bullets\":[\"\",\"\",\"\"]}",
+        "batching": {}
+      },
+      "id": "413888f2-a66e-431d-96d3-91dcac8926d7",
+      "name": "Explainer LLM : Explain Fee with Facts",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1968,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=ROLE\nYou are a senior product analyst at Groww (India's investing app). Your job is to turn raw Play Store reviews into themes a product team can act on this week.\n\nDATA\nBelow are {{ $json.theme_sample_size }} reviews, randomly sampled from {{ $json.date_from }} to {{ $json.date_to }}. Each line is: #number (rating) text. Reviews may be in English, Hindi or Hinglish; read them for meaning, not keywords.\n\nHOW TO BUILD THEMES\n1. Discover AT MOST 5 themes from what users actually say. Never start from a preset list.\n2. Make each theme SPECIFIC and ACTIONABLE. Good: \"Orders stuck or delayed at market open\". Bad: \"Bugs\" or \"Issues\".\n3. Themes must not overlap: one review fits one theme only.\n4. Generic praise with no detail (\"good app\", \"nice\", \"best app\") goes into at most ONE praise theme, so it does not crowd out real problems.\n5. Merge reviews that describe the same problem in different words or languages.\n6. Do not invent problems that are not in the reviews.\n\nLABELLING\n7. Assign EVERY review number from 1 to {{ $json.theme_sample_size }} to exactly one theme number (1 to 5), or 0 if it fits none.\n\nQUOTES\n8. For each theme, choose 2 review numbers that are the clearest real examples: concrete situations over vague opinions, and no names, phone numbers, emails or account details.\n\nSELF-CHECK BEFORE ANSWERING\n- At most 5 themes, none overlapping, none vague.\n- Every review number appears exactly once in \"labels\".\n- Output is valid JSON only, with no markdown or extra text.\n\nOUTPUT (exactly this shape)\n{\"themes\":[{\"name\":\"\",\"description\":\"one line: what users experience\",\"sentiment\":\"positive|negative|mixed\",\"product_area\":\"e.g. orders, payments, app performance, support, charges\",\"quote_nums\":[0,0]}],\"labels\":{\"1\":0,\"2\":0}}\n\nREVIEWS\n{{ $json.theme_sample_text }}",
+        "batching": {}
+      },
+      "id": "eff190b1-cde3-45fb-8d70-09f30ac4265d",
+      "name": "Themes LLM : Find Review Themes",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        352,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=ROLE\nYou are a customer-support insights analyst at Groww (India's investing app). Support wants to proactively explain the ONE fee or charge that confuses users most.\n\nDATA\nBelow are Play Store reviews that mention money, fees or charges. Each line is: [review_id] (rating) text. Reviews may be in English, Hindi or Hinglish; read them for meaning.\n\nCONFUSION vs COMPLAINT\n- A complaint is \"charges are too high\". That alone is NOT confusion.\n- Confusion is when users do not understand WHAT a charge is, WHY they were charged, WHEN it applies, or why the amount DIFFERS from what they expected (for example \"brokerage is 20 but more money got deducted\").\n\nSTEPS\n1. Ignore reviews that are not really about a fee or charge (for example pure customer-service or login complaints).\n2. Group the remaining reviews by the specific charge they are about. Be as specific as users are. These are examples of granularity, not a list to choose from.\n3. Pick the ONE charge with the strongest evidence of confusion (most reviews showing misunderstanding, not just anger).\n4. Describe the gap between what users expect and what they notice.\n\nRULES\n- Use only what the reviews say. Do not state real fee amounts or rules unless users mention them; official facts will be checked later.\n- Copy evidence review_ids exactly as they appear inside the square brackets.\n\nOUTPUT: valid JSON only, no markdown:\n{\"fee_name\":\"short name of the charge\",\"confusion\":\"one sentence: what users misunderstand\",\"user_expectation\":\"what users think they are paying or why\",\"what_users_notice\":\"what they actually see happen\",\"user_phrasing\":[\"2-3 short phrases users actually use\"],\"evidence_ids\":[\"up to 15 review_ids showing this confusion\"],\"topics_to_verify\":[\"2-3 facts the support explanation must confirm from official Groww pages\"]}\n\nREVIEWS\n{{ $('Prep reviews').first().json.fee_sample_text }}",
+        "batching": {}
+      },
+      "id": "14fa8c74-1c76-428f-b806-f8a99e95e9f3",
+      "name": "Fee LLM : Spot Fee Complaints",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        624,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run weekly review pulse": {
+      "main": [
+        [
+          {
+            "node": "Get reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get reviews": {
+      "main": [
+        [
+          {
+            "node": "Prep reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep reviews": {
+      "main": [
+        [
+          {
+            "node": "Themes LLM : Find Review Themes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count & verify": {
+      "main": [
+        [
+          {
+            "node": "Source URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Source URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch official pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch official pages": {
+      "main": [
+        [
+          {
+            "node": "Clean sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean sources": {
+      "main": [
+        [
+          {
+            "node": "Pulse LLM : Write Weekly Pulse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble & check": {
+      "main": [
+        [
+          {
+            "node": "Review page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review page": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "MCP Agent : Delivery Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: Theme Finder": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Themes LLM : Find Review Themes",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini : Fee Detector": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Fee LLM : Spot Fee Complaints",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini : Pulse Writer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Pulse LLM : Write Weekly Pulse",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini : Fee Explainer": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Explainer LLM : Explain Fee with Facts",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini : Agent Brain": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "MCP Agent : Delivery Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP : Send Tools": {
+      "ai_tool": [
+        [
+          {
+            "node": "MCP Agent : Delivery Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP Agent : Delivery Agent": {
+      "main": [
+        [
+          {
+            "node": "Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pulse LLM : Write Weekly Pulse": {
+      "main": [
+        [
+          {
+            "node": "Explainer LLM : Explain Fee with Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explainer LLM : Explain Fee with Facts": {
+      "main": [
+        [
+          {
+            "node": "Assemble & check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Themes LLM : Find Review Themes": {
+      "main": [
+        [
+          {
+            "node": "Fee LLM : Spot Fee Complaints",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fee LLM : Spot Fee Complaints": {
+      "main": [
+        [
+          {
+            "node": "Count & verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [],
+  "tags": []
+}

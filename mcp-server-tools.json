@@ -1,0 +1,102 @@
+{
+  "name": "Groww MCP Server",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "YOUR_MCP_PATH"
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpTrigger",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "b5082cd7-4407-4114-904a-7a0c191d415b",
+      "name": "MCP Server Trigger"
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Subject', ``, 'string') }}",
+        "message": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Message', ``, 'string') }}",
+        "options": {
+          "sendTo": "your-email@example.com"
+        }
+      },
+      "type": "n8n-nodes-base.gmailTool",
+      "typeVersion": 2.2,
+      "position": [
+        32,
+        112
+      ],
+      "id": "dd5ac01e-58de-4f87-96ec-53940214b7ed",
+      "name": "Create a draft in Gmail",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentURL": "https://docs.google.com/document/d/YOUR_GOOGLE_DOC_ID/edit",
+        "actionsUi": {
+          "actionFields": [
+            {
+              "action": "insert",
+              "text": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('actionFields0_Old_Text', ``, 'string') }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.googleDocsTool",
+      "typeVersion": 2,
+      "position": [
+        288,
+        112
+      ],
+      "id": "2faf82fd-5cbd-49b1-820b-ebb42137f2f1",
+      "name": "Update a document in Google Docs",
+      "credentials": {
+        "googleDocsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Docs account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Create a draft in Gmail": {
+      "ai_tool": [
+        [
+          {
+            "node": "MCP Server Trigger",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update a document in Google Docs": {
+      "ai_tool": [
+        [
+          {
+            "node": "MCP Server Trigger",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "nodeGroups": [],
+  "tags": []
+}
