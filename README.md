@@ -16,12 +16,12 @@ App reviews show exactly how users feel, but nobody has time to read thousands o
 
 | Step | Nodes | What happens |
 |---|---|---|
-| 📥 **1. Collect** | Run weekly review pulse → Get reviews → Prep reviews | A form starts the run. Reviews are pulled from Google Sheets and cleaned. |
-| 🧠 **2. Understand** | Themes LLM → Fee LLM → Count & verify | Gemini groups reviews into themes and extracts fee complaints. Code recounts every number so stats come from real counts, not AI estimates. |
-| 🔎 **3. Get the facts** | Source URLs → Fetch official pages → Clean sources | Fetches Groww's official pricing and help pages and cleans them into plain text. The fee explainer can only use these sources. |
-| ✍️ **4. Write** | Pulse LLM → Explainer LLM → Assemble & check | One model writes the weekly pulse (themes, real quotes, 3 actions). Another writes the fee explainer. Code validates the output. |
-| 🙋 **5. Human approval** | Review page → Approved? → Rejected | A reviewer reads the draft and approves or rejects it. |
-| 🚀 **6. Deliver** | MCP Agent → Approved | An AI agent uses MCP tools to append the report to a Google Doc and create a Gmail draft. Email is never sent automatically. |
+| **1. Collect** | Run weekly review pulse → Get reviews → Prep reviews | A form starts the run. Reviews are pulled from Google Sheets and cleaned. |
+| **2. Understand** | Themes LLM → Fee LLM → Count & verify | Gemini groups reviews into themes and extracts fee complaints. Code recounts every number so stats come from real counts, not AI estimates. |
+|  **3. Get the facts** | Source URLs → Fetch official pages → Clean sources | Fetches Groww's official pricing and help pages and cleans them into plain text. The fee explainer can only use these sources. |
+| **4. Write** | Pulse LLM → Explainer LLM → Assemble & check | One model writes the weekly pulse (themes, real quotes, 3 actions). Another writes the fee explainer. Code validates the output. |
+| **5. Human approval** | Review page → Approved? → Rejected | A reviewer reads the draft and approves or rejects it. |
+| **6. Deliver** | MCP Agent → Approved | An AI agent uses MCP tools to append the report to a Google Doc and create a Gmail draft. Email is never sent automatically. |
 
 ### MCP Server (second workflow)
 
