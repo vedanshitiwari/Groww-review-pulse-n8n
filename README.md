@@ -2,7 +2,6 @@
 
 An n8n workflow that turns Groww's Google Play Store reviews into a **weekly product pulse** and a **fact-checked fee explainer**, with a human approval step before anything is saved or drafted.
 
-Built as Milestone 5 of the NextLeap Product Management cohort.
 
 ![Workflow part 1](workflow-part1.png)
 ![Workflow part 2](workflow-part2.png)
